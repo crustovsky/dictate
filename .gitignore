@@ -1,0 +1,4 @@
+# Local secrets written by `elevenlabs onboard`
+/.env.local
+# Voice recordings from test/compare
+/test/clips/

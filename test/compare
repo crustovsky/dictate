@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Compare transcription backends on the same clip: accuracy by eye, latency by the clock.
+#   compare rec pl|en|auto [name]       record until Enter, keep the clip, run every backend
+#   compare run pl|en|auto clip.wav...  run every backend on existing clips (auto: no language sent)
+#
+# flm must be running:  WHISPER_CACHE_DEQUANT=0 flm serve --asr whisper-v3:turbo
+# ElevenLabs reads ELEVENLABS_API_KEY from the environment or from .env.local in the repo root.
+# RUNS=3 repeats each request to show how much the latency moves.
+#
+# The "+ hint" and "+ terms" lines send the same word list: as a Whisper prompt to flm, and as
+# keyterms to ElevenLabs (plus English as a secondary language on Polish clips).
+
+flm=http://127.0.0.1:52625
+eleven=https://api.elevenlabs.io/v1/speech-to-text
+eleven_model=${ELEVEN_MODEL:-scribe_v3}
+hint="Claude, Claude Code, Hyprland, Quickshell, commit, refactor, TypeScript, Cloudflare"
+root=$(dirname "$(dirname "$(realpath "$0")")")
+clips=$root/test/clips
+[[ -z $ELEVENLABS_API_KEY && -f $root/.env.local ]] && source "$root/.env.local"
+
+# curl reads the key from a private file, so it never shows up in ps
+if [[ -n $ELEVENLABS_API_KEY ]]; then
+    key_header=$(mktemp)
+    trap 'rm -f "$key_header"' EXIT
+    printf 'xi-api-key: %s\n' "$ELEVENLABS_API_KEY" > "$key_header"
+fi
+
+usage() { sed -n '2,5s/^# \{0,1\}//p' "$0" >&2; exit 1; }
+
+# request <label> <curl args...>: prints time, then the text or the error
+request() {
+    local label=$1 out code secs body i
+    shift
+    for ((i = 0; i < ${RUNS:-1}; i++)); do
+        out=$(curl -s --max-time 60 -w '\n%{http_code} %{time_total}' "$@")
+        read -r code secs <<< "${out##*$'\n'}"
+        body=${out%$'\n'*}
+        if [[ $code == 200 ]]; then
+            printf '  %-12s %5.2f s  %s\n' "$label" "$secs" "$(jq -r '.text' <<< "$body" | sed 's/^ //')"
+        else
+            printf '  %-12s %5.2f s  HTTP %s: %s\n' "$label" "$secs" "$code" "$body"
+        fi
+    done
+}
+
+compare() {
+    local lang=$1 clip=$2
+    [[ -f $clip ]] || { echo "no such clip: $clip" >&2; return 1; }
+    printf '%s (%s, %s)\n' "$clip" "$lang" "$(ffprobe -v error -show_entries format=duration -of csv=p=0 -- "$clip" | xargs printf '%.1f s')"
+
+    # auto sends no language at all, so each backend detects it
+    local flm_lang=() eleven_lang=()
+    [[ $lang != auto ]] && flm_lang=(-F language="$lang") eleven_lang=(-F language_code="$lang")
+
+    if curl -s -o /dev/null --max-time 2 "$flm/v1/models"; then
+        request "flm" "$flm/v1/audio/transcriptions" -F file=@"$clip" -F model=whisper-v3 "${flm_lang[@]}"
+        request "flm + hint" "$flm/v1/audio/transcriptions" -F file=@"$clip" -F model=whisper-v3 "${flm_lang[@]}" -F prompt="$hint"
+    else
+        echo "  flm          not running on $flm"
+    fi
+
+    if [[ -n $ELEVENLABS_API_KEY ]]; then
+        local base=("$eleven" -H @"$key_header" -F file=@"$clip" -F model_id="$eleven_model"
+            "${eleven_lang[@]}" -F tag_audio_events=false -F timestamps_granularity=none)
+        local terms=() term
+        while IFS= read -r term; do terms+=(-F keyterms="$term"); done <<< "${hint//, /$'\n'}"
+        [[ $lang == pl ]] && terms+=(-F secondary_language_codes=en)
+        request "11labs" "${base[@]}"
+        request "11labs+terms" "${base[@]}" "${terms[@]}"
+    else
+        echo "  11labs       skipped, ELEVENLABS_API_KEY is not set"
+    fi
+}
+
+case $1 in
+    rec)
+        [[ $2 == @(pl|en|auto) ]] || usage
+        mkdir -p "$clips"
+        clip=$clips/${3:-$2-$(date +%H%M%S)}.wav
+        pw-record --rate 16000 --channels 1 "$clip" &
+        pid=$!
+        read -rp "Recording ($2). Speak, then press Enter. "
+        kill -INT "$pid"
+        wait "$pid" 2> /dev/null
+        compare "$2" "$clip"
+        ;;
+    run)
+        [[ $2 == @(pl|en|auto) && -n $3 ]] || usage
+        lang=$2
+        shift 2
+        for clip in "$@"; do compare "$lang" "$clip"; done
+        ;;
+    *)
+        usage
+        ;;
+esac

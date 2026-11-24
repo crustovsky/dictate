@@ -1,0 +1,13 @@
+[Unit]
+Description=FastFlowLM Whisper on NPU
+
+[Service]
+# without this the model takes about 2.4 GB instead of 1 GB
+Environment=WHISPER_CACHE_DEQUANT=0
+# give the bar a state file to watch from login, and clear a stale state after a crash
+ExecStartPre=/bin/sh -c 'mkdir -p %t/dictate && echo idle > %t/dictate/state'
+ExecStart=/usr/bin/flm serve --asr whisper-v3:turbo
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

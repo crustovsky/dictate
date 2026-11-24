@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Hold-to-talk dictation: record while a key is held, then type the transcript.
+#   dictate start local|cloud [lang]   local = flm on the NPU, cloud = ElevenLabs
+#                                      lang (pl, en, ...) forces a language; default is auto-detect
+#   dictate stop                       transcribe and type into the focused window
+#   dictate test                       check the setup: tools, microphone, both backends, binds
+set -o pipefail
+
+dir=$XDG_RUNTIME_DIR/dictate
+clip=$dir/clip.wav
+flm=http://127.0.0.1:52625/v1/audio/transcriptions
+eleven=https://api.elevenlabs.io/v1/speech-to-text
+hint=""            # words flm tends to mishear, comma separated; costs about 0.6 s per clip
+min_bytes=16000    # 0.5 s of 16 kHz mono; shorter clips are dropped
+min_mean_db=-50    # quieter on average than this is silence (room noise is about -70, speech -30 to -18)
+mkdir -p "$dir"
+
+# state file for the bar: "idle", or "recording|transcribing <backend>"
+state() { echo "$*" > "$dir/state"; }
+
+usage() { sed -n '2,6s/^# \{0,1\}//p' "$0" >&2; exit 1; }
+
+# prints the transcript; fails if the backend does not answer with one
+transcribe() {
+    local args auth=""
+    case $backend in
+        local)
+            args=("$flm" -F model=whisper-v3)
+            [[ -n $lang ]] && args+=(-F language="$lang")
+            [[ -n $hint ]] && args+=(-F prompt="$hint")
+            ;;
+        cloud)
+            source "${XDG_CONFIG_HOME:-$HOME/.config}/dictate/env" || return 1
+            auth="header = \"xi-api-key: $ELEVENLABS_API_KEY\""
+            args=("$eleven" -F model_id=scribe_v3
+                -F tag_audio_events=false -F timestamps_granularity=none -F no_verbatim=true)
+            [[ -n $lang ]] && args+=(-F language_code="$lang")
+            ;;
+    esac
+    # the key reaches curl through a pipe, not the command line, where ps would show it
+    curl -sf --max-time 30 -K <(echo "$auth") "${args[@]}" -F file=@"$clip" | jq -er '.text'
+}
+
+# true when the clip is too short or too quiet to hold speech; Whisper invents text for those
+silent() {
+    local mean
+    (($(stat -c %s "$clip" 2> /dev/null || echo 0) < min_bytes)) && return 0
+    mean=$(ffmpeg -hide_banner -nostats -i "$clip" -af volumedetect -f null - 2>&1 |
+        sed -n 's/.*mean_volume: \(-\{0,1\}[0-9]*\).*/\1/p')
+    [[ -n $mean ]] && ((mean < min_mean_db))
+}
+
+case $1 in
+    start)
+        [[ $2 == local || $2 == cloud ]] || usage
+        # a second key press while one recording runs changes nothing
+        [[ -f $dir/rec.pid ]] && kill -0 "$(< "$dir/rec.pid")" 2> /dev/null && exit 0
+        rm -f "$clip"
+        echo "$2 $3" > "$dir/mode"
+        state recording "$2"
+        # the pid file exists before the recorder does, so a quick tap still finds it;
+        # exec keeps the pid, timeout caps a recording whose stop never came
+        echo $$ > "$dir/rec.pid"
+        exec timeout -s INT 120 pw-record --rate 16000 --channels 1 "$clip"
+        ;;
+    stop)
+        # claim the pid file; both key combos can fire a release, only one gets to stop
+        for _ in 1 2 3 4 5 6; do
+            mv "$dir/rec.pid" "$dir/rec.pid.$$" 2> /dev/null && break
+            sleep 0.05
+        done
+        [[ -f $dir/rec.pid.$$ ]] || exit 0
+        pid=$(< "$dir/rec.pid.$$")
+        rm "$dir/rec.pid.$$"
+        # let pw-record finish the wav; -s matters, tail polls once a second by default
+        kill -INT "$pid" 2> /dev/null && tail --pid="$pid" -s 0.02 -f /dev/null
+        read -r backend lang < "$dir/mode"
+        # however this ends, the bar goes back to idle and the recording does not linger
+        trap 'rm -f "$clip"; state idle' EXIT
+
+        silent && exit 0
+        state transcribing "$backend"
+        if text=$(transcribe); then
+            text=${text# }
+            [[ -n $text ]] && wtype -- "$text"
+        else
+            notify-send -a dictate "Dictation failed" "No transcript from the $backend backend."
+        fi
+        ;;
+    test)
+        fails=0
+        ok() { printf '  ok    %s\n' "$*"; }
+        bad() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
+        trap 'rm -f "$dir/test.wav" "$dir/tone.wav"' EXIT
+
+        echo "tools"
+        for tool in pw-record curl jq wtype ffmpeg notify-send; do
+            if command -v "$tool" > /dev/null; then ok "$tool"; else bad "$tool is not installed"; fi
+        done
+
+        echo "microphone (records one second, kept on this machine)"
+        clip=$dir/test.wav
+        timeout -s INT 1.2 pw-record --rate 16000 --channels 1 "$clip" 2> /dev/null
+        level=$(ffmpeg -hide_banner -nostats -i "$clip" -af volumedetect -f null - 2>&1 |
+            sed -n 's/.*mean_volume: \(-\{0,1\}[0-9]*\).*/\1/p')
+        if [[ -z $level ]]; then
+            bad "pw-record produced no usable recording"
+        elif ((level >= min_mean_db)); then
+            ok "recorded at $level dB, above the $min_mean_db dB gate: fine if you were speaking, else raise min_mean_db"
+        else
+            ok "recorded at $level dB, silence is below the $min_mean_db dB gate"
+        fi
+
+        # the backends get a generated tone, so no voice leaves the machine during a test
+        clip=$dir/tone.wav lang=""
+        ffmpeg -loglevel error -y -f lavfi -i sine=frequency=440:duration=1 -ar 16000 -ac 1 "$clip"
+        for backend in local cloud; do
+            echo "$backend backend"
+            if [[ $backend == local ]]; then
+                command -v flm > /dev/null && ok "flm $(flm version 2> /dev/null | grep -o '[0-9][0-9.]*' | head -1)" || bad "flm is not installed"
+                systemctl --user is-active -q flm-asr && ok "flm-asr service is running" || bad "flm-asr service is not running"
+            else
+                key=${XDG_CONFIG_HOME:-$HOME/.config}/dictate/env
+                if [[ ! -f $key ]]; then
+                    bad "no key file at $key"
+                    continue
+                fi
+                [[ $(stat -c %a "$key") == 600 ]] && ok "key file is private" || bad "key file is readable by others: chmod 600 $key"
+            fi
+            start=$(date +%s%N)
+            if transcribe > /dev/null; then
+                ok "answered in $((($(date +%s%N) - start) / 1000000)) ms"
+            else
+                bad "no answer to a transcription request"
+            fi
+        done
+
+        echo "hotkeys"
+        [[ -x $HOME/.local/bin/dictate ]] && ok "script is at ~/.local/bin/dictate" || bad "~/.local/bin/dictate is missing, the binds call it by that path"
+        binds=$(hyprctl binds -j 2> /dev/null | jq '[.[] | select(.description | test("Dictate"))] | length')
+        ((${binds:-0} >= 2)) && ok "$binds dictation binds registered in Hyprland" || bad "no dictation binds in Hyprland: is require(\"dictate\") in hyprland.lua?"
+
+        ((fails == 0)) && echo "all good" || echo "$fails problem(s)"
+        exit $((fails > 0))
+        ;;
+    *)
+        usage
+        ;;
+esac
